@@ -46,18 +46,11 @@ HMODULE Dll;
 bool run()
 {
     // Get Execution Directory
-    const LPCWSTR entry = L"/";
-    char_t host_path[MAX_PATH];
-    auto size = ::GetFullPathNameW(entry, sizeof(host_path) / sizeof(char_t), host_path, nullptr);
-    assert(size != 0);
-    string_t root_path = host_path;
-    auto pos = root_path.find_last_of(DIR_SEPARATOR);
-    assert(pos != string_t::npos);
-    root_path = root_path.substr(0, pos + 1);
-
-    std::cout << "Executing in:" << std::endl;
-    std::cout << root_path.c_str() << std::endl;
-
+    TCHAR buffer[MAX_PATH] = { 0 };
+    GetModuleFileName( NULL, buffer, MAX_PATH );
+    std::wstring::size_type pos = std::wstring(buffer).find_last_of(L"\\/");
+    string_t root_path = std::wstring(buffer).substr(0, pos).append(L"\\");
+    
     return run_net(root_path);
 }
 
@@ -76,37 +69,45 @@ namespace
         const string_t config_path = root_path + STR("DotNetLib.runtimeconfig.json");
         load_assembly_and_get_function_pointer_fn load_assembly_and_get_function_pointer = nullptr;
         load_assembly_and_get_function_pointer = get_dotnet_load_assembly(config_path.c_str());
-        assert(load_assembly_and_get_function_pointer != nullptr && "Failure: get_dotnet_load_assembly()");
-
-        // Load managed assembly and get function pointer to a managed method
-        const string_t dotnetlib_path = root_path + STR("DotNetLib.dll");
-        const char_t *dotnet_type = STR("DotNetLib.Lib, Entry");
-        const char_t *dotnet_type_method = STR("Init");
         
+        assert(load_assembly_and_get_function_pointer != nullptr && "Failure: get_dotnet_load_assembly()");
+        
+        // Get Cancer (Load DLL)
+        const string_t dotnetlib_path = root_path + STR("DotNetLib.dll");
+        const string_t dotnet_type = STR("DotNetLib.Entry, DotNetLib");
+        const string_t dotnet_type_method = STR("Init");
+
+        std::cout << "Loading DLL:" << std::endl;
+        std::wcout << dotnetlib_path << std::endl;
+        std::wcout << dotnet_type << std::endl;
+        std::wcout << dotnet_type_method << std::endl;
+        
+        // Function pointer to managed delegate
+        component_entry_point_fn init = nullptr;
+        int rc = load_assembly_and_get_function_pointer(
+            dotnetlib_path.c_str(),
+            dotnet_type.c_str(),
+            dotnet_type_method.c_str(),
+            nullptr,
+            nullptr,
+            (void**)&init);
+        
+        assert(rc == 0 && init != nullptr && "Failure: load_assembly_and_get_function_pointer()");
+
         // Run managed code
         struct lib_args
         {
         };
-
-        // Function pointer to managed delegate with non-default signature
-        typedef void (CORECLR_DELEGATE_CALLTYPE *custom_entry_point_fn)(lib_args args);
-        custom_entry_point_fn init = nullptr;
         lib_args args
         {
         };
-
-        // UnmanagedCallersOnly
-        int rc = load_assembly_and_get_function_pointer(
-            dotnetlib_path.c_str(),
-            dotnet_type,
-            STR("CustomEntryPointUnmanagedCallersOnly") /*method_name*/,
-            UNMANAGEDCALLERSONLY_METHOD,
-            nullptr,
-            (void**)&init);
-        assert(rc == 0 && custom != nullptr && "Failure: load_assembly_and_get_function_pointer()");
-        init(args);
-
-        return EXIT_SUCCESS;
+        
+        if (init(&args, sizeof(args)) == 0)
+        {
+            return EXIT_SUCCESS;
+        }
+        
+        return EXIT_FAILURE;
     }
 }
 
@@ -134,15 +135,18 @@ namespace
     bool load_hostfxr(const char_t *assembly_path)
     {
         get_hostfxr_parameters params { sizeof(get_hostfxr_parameters), assembly_path, nullptr };
+        
         // Pre-allocate a large buffer for the path to hostfxr
         char_t buffer[MAX_PATH];
         size_t buffer_size = sizeof(buffer) / sizeof(char_t);
+
         int rc = get_hostfxr_path(buffer, &buffer_size, &params);
         if (rc != 0)
             return false;
-
+        
         // Load hostfxr and get desired exports
         void *lib = load_library(buffer);
+        
         init_for_cmd_line_fptr = (hostfxr_initialize_for_dotnet_command_line_fn)get_export(lib, "hostfxr_initialize_for_dotnet_command_line");
         init_for_config_fptr = (hostfxr_initialize_for_runtime_config_fn)get_export(lib, "hostfxr_initialize_for_runtime_config");
         get_delegate_fptr = (hostfxr_get_runtime_delegate_fn)get_export(lib, "hostfxr_get_runtime_delegate");
@@ -161,7 +165,7 @@ namespace
         int rc = init_for_config_fptr(config_path, nullptr, &cxt);
         if (rc != 0 || cxt == nullptr)
         {
-            std::cerr << "Init failed: " << std::hex << std::showbase << rc << std::endl;
+            std::cout << "Init failed: " << std::hex << std::showbase << rc << std::endl;
             close_fptr(cxt);
             return nullptr;
         }
@@ -172,7 +176,7 @@ namespace
             hdt_load_assembly_and_get_function_pointer,
             &load_assembly_and_get_function_pointer);
         if (rc != 0 || load_assembly_and_get_function_pointer == nullptr)
-            std::cerr << "Get delegate failed: " << std::hex << std::showbase << rc << std::endl;
+            std::cout << "Get delegate failed: " << std::hex << std::showbase << rc << std::endl;
 
         close_fptr(cxt);
         return (load_assembly_and_get_function_pointer_fn)load_assembly_and_get_function_pointer;
@@ -206,12 +210,22 @@ QWORD WINAPI MainThread(LPVOID param)
     std::cout << "Injected..." << std::endl;
     std::cout << "CoreCLR Starting" << std::endl;
 
-    if (run() == 1)
+    try
     {
-        shutdown(fp, "CoreCLR Error");
+        if (run() == 1)
+        {
+            std::cout << "CoreCLR Error (Insert to Close)" << std::endl;
+        }
+        else
+        {
+            std::cout << "CoreCLR Exited (Insert to Close)" << std::endl;
+        }
     }
-
-    std::cout << "CoreCLR Exited (Insert to Close)" << std::endl;
+    catch (int exception)
+    {
+        std::cout << "Exception: " << exception << std::endl;
+    }
+    
     while (true)
     {
         Sleep(50);
@@ -230,8 +244,9 @@ BOOL __stdcall DllMain(HINSTANCE hModule, DWORD dwReason, LPVOID lpReserved)
     {
     case 1:
         Dll = hModule;
+        
         HANDLE hMainThread = CreateThread(nullptr, 0, LPTHREAD_START_ROUTINE(MainThread), hModule, 0, nullptr);
-
+        
         if (hMainThread)
             CloseHandle(hMainThread);
 
